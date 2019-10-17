@@ -1,0 +1,162 @@
+---------------------------------ranger分区创建函数v 3.0--可用-------------------------------------
+--改进：增加分区命名规范
+--月分区遵循:p201901
+--日分区遵循:p20190101
+--自动创建range分区函数
+create or replace function public.table_add_partition(v_schema text, v_table text, d_day text)
+returns void
+language 'plpythonu'
+cost 100
+volatile
+as $BODY$
+
+global par_end_dt
+global input_day
+global table_name
+# 分区批量创建函数
+def run_add_par_sql(st='', et='', frequency='m'):
+    """
+    @para
+    st:开始日期（既当前最新分区的结束日期）
+    et:结束日期（输入日期）
+    frequency:分区频度。目前支持月、日ranger分区自动创建
+    @return
+    1:函数执行失败
+    0:函数执行成功
+    """
+    st_date = st
+    et_date = et
+    if frequency.lower() == 'm':
+        try:
+            months_between = (plpy.execute("SELECT abs(oracompat.months_between('%s','%s')) months_between;" % (et_date, st_date)))[0]['months_between']
+            for m in range(int(months_between)+1):
+                et_date = (plpy.execute("select to_char(oracompat.add_months('%s',1),'yyyymmdd') next_months;" % (st_date)))[0]['next_months']
+                # 遵循月分区命名规范 p201901
+                add_mon_sql = "alter table %s add partition p%s start('%s')inclusive end ('%s')exclusive" % ( table_name, st_date[0:6],st_date, et_date)
+                plpy.info('开始添加第%i个月频度分区：%s~%s' % (m+1, st_date, et_date))
+                plpy.info(add_mon_sql)
+                plpy.execute(add_mon_sql)
+                st_date = et_date
+        except BaseException, e:
+            plpy.error(e)
+            exit(1)
+    if frequency.lower() == 'd':
+        try:
+            days_between = (plpy.execute("select  to_date('%s','yyyymmdd')- to_date('%s','yyyymmdd') days_between;" % (et_date, st_date)))[0]['days_between']
+            for d in range(int(days_between)+1):
+                et_date = (plpy.execute("select to_char(to_date('%s','yyyymmdd')+1,'yyyymmdd') next_days;" % (st_date)))[0]['next_days']
+                # 遵循日分区命名规范 p20190101
+                add_day_sql = "alter table %s add partition p%s start('%s')inclusive end ('%s')exclusive" % ( table_name, st_date,st_date, et_date)
+                plpy.info('开始添加第%i	个日频度分区：%s~%s' % (d+1, st_date, et_date))
+                plpy.info(add_day_sql)
+                plpy.execute(add_day_sql)
+                st_date = et_date
+        except BaseException, e:
+            plpy.error(e)
+            exit(1)
+    return 0
+
+# 将输入日期格式：yyyy/mm/dd、yyyy-mm-dd、yyyymmdd 统一转换成yyymmdd格式
+input_day = d_day
+if len(d_day) == 10:
+    input_day = input_day.replace('-', '')
+    input_day = input_day.replace('/', '')
+    par_end_dt = input_day[0:6]+'01'
+    plpy.info('统一日期格式YYYYMMDD：%s' % (par_end_dt))
+elif len(d_day)>8 and len(d_day)<10:
+    plpy.error('日期格式不正确！支持以下日期格式：yyyymmdd、yyyy-mm-dd、yyyy/mm/dd')
+else:
+    par_end_dt = d_day
+#public 模式下的表，其regclass对象不带模式名，需要判断处理
+if v_schema.lower() == 'public':
+    table_name = v_table
+else:
+    table_name = v_schema + '.' + v_table
+
+# 分区判断
+plpy.info('开始执行分区创建')
+is_par_sql = "select 1 as flag from pg_partition a,pg_class b where  a.parrelid=b.oid and (a.parrelid::regclass)::text = '%s';"%(table_name)
+# plpy.info(is_par_sql)
+try:
+    is_partition = plpy.execute(is_par_sql)
+except BaseException, e:
+    plpy.error(e)
+
+if list(is_partition) == []:
+    plpy.error('%s不是分区表，退出分区创建过程'%(table_name))
+    exit(1)
+
+par_typ_sql = "select a.parkind from pg_partition a where (a.parrelid::regclass)::text = '%s';"%(table_name)
+# plpy.info(par_typ_sql)
+
+try:
+    partition_typ = plpy.execute(par_typ_sql)
+except BaseException,e:
+    plpy.error(e)
+
+if partition_typ[0]['parkind'] != 'r':
+    plpy.info('%s 不是ranger分区表,不满足分区创建条件，退出过程'%(table_name))
+    exit(1)
+
+# 分区创建
+#分区频度判断SQL
+ranger_sql ="""SELECT  to_date(substr(q.partitionrangeend,1,8),'yyyymmdd')-to_date(substr(q.partitionrangestart,1,8),'yyyymmdd') datediff,
+                       substr(q.partitionrangeend,1,8) partitionrangeend,
+                       substr(q.partitionrangestart,1,8) partitionrangestart,
+                       abs(oracompat.months_between( to_date(substr(q.partitionrangeend,1,8),'yyyymmdd'),to_date(substr(q.partitionrangestart,1,8),'yyyymmdd'))) date_between
+               FROM
+                  (select pp.parrelid::regclass table_name,
+                          pr1.parchildrelid::regclass child_tbl_name,
+                          pr1.parname as partition_name,
+                          pr1.parruleord as partitionposition,
+                          translate(pg_get_expr(pr1.parrangestart,pr1.parchildrelid),'-'':date character varying bpchar numeric double percision timestamp without time zone','') as partitionrangestart,
+                          translate(pg_get_expr(pr1.parrangeend,pr1.parchildrelid),'-'':date character varying bpchar numeric double percision timestamp without time zone','') as partitionrangeend,
+                          translate(pg_get_expr(pr1.parrangeevery,pr1.parchildrelid),'-'':date character varying bpchar numeric double percision timestamp without time zone','') as parrangeevery
+                   FROM  pg_partition pp, pg_partition_rule pr1
+                   where pp.paristemplate = false 
+                   and pr1.paroid=pp.oid 
+                   and pp.parkind = 'r' 
+                   and (pp.parrelid::regclass)::text = '%s'
+                   and pr1.parruleord in (select max(parruleord) from pg_partition pp, pg_partition_rule pr1
+                                          where pp.paristemplate = false 
+                                          and pr1.paroid=pp.oid  
+                                          and  (pp.parrelid::regclass)::text = '%s'
+                                          )) q;
+          """%(table_name, table_name)
+# plpy.info(ranger_sql)
+
+try:
+    datediff = plpy.execute(ranger_sql)
+    # plpy.info(list(datediff))
+except BaseException, e:
+    plpy.error(e)
+
+if list(datediff) is None:
+    plpy.error('pg_partiotion，pg_partiotion_rule系统表统计信息不准确，请更新后重试')
+    exit(1)
+
+# 新分区开始日期既当前最新分区的结束日期
+par_start_dt = datediff[0]['partitionrangeend']
+plpy.info('分区起始日期：%s，结束日期为：%s' % (par_start_dt,par_end_dt))
+# 判断输入日期是否满足新分区的创建要求
+if int(par_end_dt) <= int(par_start_dt):
+    plpy.info('当前最新的分区区间为：%s~%s！输入日期: %s 小于当前分区结束日期: %s，无法创建新分区！程序退出！'%(datediff[0]['partitionrangestart'], datediff[0]['partitionrangeend'], d_day,par_start_dt))
+    exit(1)
+# 判断分区频度，并创建分区
+# plpy.info(type(datediff[0]['datediff']))
+
+if datediff[0]['date_between'] == 1:
+    plpy.info('最新的分区区间为：%s~%s，为月频度分区，开始创建新的月频度分区：%s' % (datediff[0]['partitionrangestart'], datediff[0]['partitionrangeend'], d_day))
+    run_add_par_sql(par_start_dt, par_end_dt, 'm')
+elif datediff[0]['date_between'] < 1:
+    if datediff[0]['datediff'] == 1:
+        plpy.info('最新的分区区间为：%s~%s，为日频度分区，开始创建新的日频度分区：%s' % (datediff[0]['partitionrangestart'], datediff[0]['partitionrangeend'], d_day))
+        run_add_par_sql(par_start_dt, par_end_dt, 'd')
+    else:
+        plpy.warning('不支持其他频度分区！！')
+        exit(1)
+else:
+    plpy.error('输入日期不满足日分区和月分区定义！！！')
+    exit(1)
+$BODY$
+;
