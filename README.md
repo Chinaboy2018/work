@@ -1,2 +1,2 @@
 # work
-A Python based on project requirements：Small script to generate ddl from Excel
+A Python script based on project requirements：Small script to generate ddl from Excel
